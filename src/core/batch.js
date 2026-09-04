@@ -3,6 +3,7 @@
  */
 import { evaluate, evaluateAsync, getClient, getChartApi, getChartCollection, safeString } from '../connection.js';
 import { waitForChartReady } from '../wait.js';
+import { boundedCapture } from './capture.js';
 import { writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -38,7 +39,9 @@ export async function batchRun({ symbols, timeframes, action, delay_ms, ohlcv_co
         if (action === 'screenshot') {
           mkdirSync(SCREENSHOT_DIR, { recursive: true });
           const client = await getClient();
-          const { data } = await client.Page.captureScreenshot({ format: 'png' });
+          // Bounded + occlusion-aware (see capture.js): a timeout throws and is
+          // recorded as this combo's error instead of hanging the whole batch.
+          const { data } = await boundedCapture(client, { format: 'png' });
           const ts = new Date().toISOString().replace(/[:.]/g, '-');
           const fname = `batch_${symbol}_${tf || 'default'}_${ts}`.replace(/[\/\\]/g, '_') + '.png';
           const filePath = join(SCREENSHOT_DIR, fname);
