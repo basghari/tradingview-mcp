@@ -104,10 +104,15 @@ export async function captureScreenshot({ region, filename, method, waitForRende
   let clip = undefined;
 
   if (region === 'chart') {
+    // .chart-container spans the panes PLUS the price scales and time axis;
+    // [data-name="pane-canvas"] is only the pane's drawing surface and crops
+    // both axes out, so it is kept as a last-resort fallback only.
     const bounds = await evaluate(`
       (function() {
-        var el = document.querySelector('[data-name="pane-canvas"]')
+        var el = document.querySelector('.chart-container.active')
+          || document.querySelector('.chart-container')
           || document.querySelector('[class*="chart-container"]')
+          || document.querySelector('[data-name="pane-canvas"]')
           || document.querySelector('canvas');
         if (!el) return null;
         var rect = el.getBoundingClientRect();
