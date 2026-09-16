@@ -3,11 +3,12 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 
 export function registerDataTools(server) {
-  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
+  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context). The bar-count parameter is `count`; `bars` is accepted as an alias.', {
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
+    bars: z.coerce.number().optional().describe('Alias for count. Zod strips unknown keys silently, so without this alias a call passing bars instead of count returned the 100-bar default with no error (observed 2026-09-16: a 260-bar request silently came back as 100 bars). count wins when both are given.'),
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),
-  }, async ({ count, summary }) => {
-    try { return jsonResult(await core.getOhlcv({ count, summary })); }
+  }, async ({ count, bars, summary }) => {
+    try { return jsonResult(await core.getOhlcv({ count: count ?? bars, summary })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
