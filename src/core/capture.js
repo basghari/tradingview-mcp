@@ -28,6 +28,20 @@ export function withTimeout(promise, ms, stage) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+async function waitForVisible(ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    try {
+      if (await withTimeout(evaluate('document.visibilityState'), 1000, 'visibility-probe') === 'visible') {
+        await new Promise((r) => setTimeout(r, 1500)); // let the chart repaint
+        return true;
+      }
+    } catch { /* keep polling */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return false;
+}
+
 async function bringToFront(client) {
   try {
     await withTimeout(client.Page.bringToFront(), BRING_TO_FRONT_TIMEOUT_MS, 'bring-to-front');
@@ -42,6 +56,13 @@ async function bringToFront(client) {
   try {
     const vis = await withTimeout(evaluate('document.visibilityState'), 2000, 'visibility-probe');
     if (vis !== 'visible' && process.platform === 'darwin') {
+      // A sleeping display stops all painting even with the anti-throttling
+      // launch switches (verified 2026-10-19: display off behind a locked
+      // screen gave a stale frame; after `caffeinate -u` the same locked
+      // session captured fresh). Declaring user activity wakes the display
+      // without unlocking; it sleeps again on the normal idle timer.
+      await new Promise((resolve) => execFile('caffeinate', ['-u', '-t', '2'], () => resolve()));
+      await waitForVisible(5000);
       await new Promise((resolve) => execFile('open', ['-a', 'TradingView'], () => resolve()));
       // `open -a` activates the app but does not restore minimized windows
       // (verified 2026-09-04: the CDP page sat in a minimized window, stayed
