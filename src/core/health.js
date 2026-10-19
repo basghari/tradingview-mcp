@@ -359,7 +359,16 @@ export async function launch({ port, kill_existing, _deps } = {}) {
 
   if (killFirst) await killExisting();
 
-  const cdpArgs = [`--remote-debugging-port=${cdpPort}`];
+  // Chromium stops painting a page it thinks nobody can see (occluded window,
+  // locked screen), which froze every chart capture in the 2026-10-19
+  // scheduled run behind a locked Mac. These switches keep the renderer and
+  // its timers running while the window is hidden.
+  const cdpArgs = [
+    `--remote-debugging-port=${cdpPort}`,
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling',
+  ];
   let child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
   let info = null;
   let usedLocalCopy = false;
