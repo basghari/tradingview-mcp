@@ -67,6 +67,7 @@ export async function healthCheck() {
   `);
 
   const update = await checkForUpdate();
+  const switches = inspectLaunchSwitches();
 
   return {
     success: true,
@@ -78,8 +79,77 @@ export async function healthCheck() {
     chart_resolution: state?.resolution || 'unknown',
     chart_type: state?.chartType ?? null,
     api_available: state?.apiAvailable ?? false,
+    anti_throttle_ok: switches.ok,
+    anti_throttle: switches,
+    ...(switches.ok !== true && { warning: _switchWarning(switches) }),
     ...(update && { update }),
   };
+}
+
+// Chromium stops painting a page it thinks nobody can see (occluded window,
+// locked screen), which froze every chart capture in the 2026-10-19
+// scheduled run behind a locked Mac. These switches keep the renderer and
+// its timers running while the window is hidden. They only take effect if
+// the TradingView main process was started with them, so launch() verifies
+// them and the health check reports them.
+export const ANTI_THROTTLE_SWITCHES = [
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding',
+  '--disable-background-timer-throttling',
+];
+
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+function _firstPid(out) {
+  const pid = Number(String(out).trim().split(/\s+/)[0]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+// PID of the process listening on the CDP port, or null if none.
+function _cdpListenerPid({ cdpPort, platform, execSync }) {
+  try {
+    const cmd = platform === 'win32'
+      ? `powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort ${cdpPort} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess"`
+      : `lsof -nP -iTCP:${cdpPort} -sTCP:LISTEN -t`;
+    return _firstPid(execSync(cmd, { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString());
+  } catch { return null; } // lsof exits 1 when nothing listens
+}
+
+function _processArgs({ pid, platform, execSync }) {
+  const cmd = platform === 'win32'
+    ? `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`
+    : `ps -ww -o args= -p ${pid}`; // -ww: never truncate to terminal width
+  return execSync(cmd, { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+}
+
+/**
+ * Read the command line of the process serving CDP and report which
+ * anti-throttling switches it was started with. ok is true/false, or null
+ * when the process could not be inspected (remote CDP host, no listener,
+ * lsof/ps unavailable). Never throws.
+ */
+export function inspectLaunchSwitches({ cdpPort = CDP_PORT, _deps } = {}) {
+  const platform = _deps?.platform || process.platform;
+  const exec = _deps?.execSync || execSync;
+  if (!LOCAL_HOSTS.has(CDP_HOST)) {
+    return { ok: null, error: `CDP host ${CDP_HOST} is not local; process arguments cannot be read` };
+  }
+  const pid = _cdpListenerPid({ cdpPort, platform, execSync: exec });
+  if (!pid) return { ok: null, error: `no process found listening on CDP port ${cdpPort}` };
+  let args;
+  try { args = _processArgs({ pid, platform, execSync: exec }); }
+  catch (e) { return { ok: null, pid, error: `could not read arguments of pid ${pid}: ${e.message}` }; }
+  const tokens = args.split(/\s+/);
+  const present = ANTI_THROTTLE_SWITCHES.filter((sw) => tokens.includes(sw));
+  const missing = ANTI_THROTTLE_SWITCHES.filter((sw) => !tokens.includes(sw));
+  return { ok: missing.length === 0, pid, present, missing };
+}
+
+function _switchWarning(sw) {
+  if (sw.ok === null) {
+    return `Could not verify TradingView's anti-throttling launch switches (${sw.error}). Chart captures may freeze while the screen is locked or the window is hidden.`;
+  }
+  return `TradingView (pid ${sw.pid}) was started without ${sw.missing.join(', ')}. Chart captures freeze while the screen is locked or the window is hidden. Relaunch it with tv_launch (kill_existing defaults to true).`;
 }
 
 export async function discover() {
@@ -211,7 +281,59 @@ function _resolveLaunchDeps(deps) {
     readdirSync: deps?.readdirSync || readdirSync,
     delay: deps?.delay || ((ms) => new Promise((r) => setTimeout(r, ms))),
     probeCdp: deps?.probeCdp || _probeCdp,
+    platform: deps?.platform || process.platform,
   };
+}
+
+// PIDs of running TradingView main processes. Matches the process name
+// exactly (pgrep -x), so helper processes ("TradingView Helper ...") and
+// shells whose command line merely mentions TradingView are never hit.
+function _mainPids({ tvPath, execSync }) {
+  try {
+    const out = execSync(`pgrep -x ${JSON.stringify(basename(tvPath))}`, { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
+    return out.split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  } catch { return []; } // pgrep exits 1 when nothing matches
+}
+
+/**
+ * Stop every running TradingView main process and verify none survives:
+ * graceful quit (osascript on macOS), then SIGTERM, then SIGKILL, by pid.
+ * Throws if an instance is still alive afterwards — spawning then would
+ * hand off to the old process and silently keep its launch arguments
+ * (2026-10-19: pkill -f left the old instance up, launch reported success
+ * connected to it, without the anti-throttling switches).
+ */
+async function _stopExisting({ tvPath, platform, execSync, delay }) {
+  const waitGone = async (ms) => {
+    for (let t = 0; t < ms; t += 500) {
+      if (_mainPids({ tvPath, execSync }).length === 0) return true;
+      await delay(500);
+    }
+    return _mainPids({ tvPath, execSync }).length === 0;
+  };
+
+  const initial = _mainPids({ tvPath, execSync });
+  if (initial.length === 0) return { stopped: [] };
+  const steps = [];
+
+  if (platform === 'darwin') {
+    try {
+      execSync(`osascript -e 'quit app "${basename(tvPath)}"'`, { timeout: 5000, stdio: 'ignore' });
+      steps.push('quit');
+    } catch { steps.push('quit-failed'); }
+    if (await waitGone(10000)) return { stopped: initial, steps };
+  }
+
+  for (const [signal, waitMs] of [['TERM', 5000], ['KILL', 3000]]) {
+    const pids = _mainPids({ tvPath, execSync });
+    if (pids.length === 0) return { stopped: initial, steps };
+    try { execSync(`kill -${signal} ${pids.join(' ')}`, { timeout: 5000, stdio: 'ignore' }); } catch { /* raced exit */ }
+    steps.push(signal);
+    if (await waitGone(waitMs)) return { stopped: initial, steps };
+  }
+
+  const survivors = _mainPids({ tvPath, execSync });
+  throw new Error(`Could not stop the running TradingView (pid ${survivors.join(', ')}) after ${steps.join(' → ')}. Quit it manually, then rerun tv_launch.`);
 }
 
 async function _probeCdp(cdpPort) {
@@ -287,7 +409,7 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   const deps = _resolveLaunchDeps(_deps);
   const cdpPort = port || CDP_PORT;
   const killFirst = kill_existing !== false;
-  const platform = process.platform;
+  const platform = deps.platform;
 
   const pathMap = {
     darwin: [
@@ -350,25 +472,19 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   }
 
   const killExisting = async () => {
-    try {
-      if (platform === 'win32') deps.execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
-      else deps.execSync('pkill -f TradingView', { timeout: 5000 });
-      await deps.delay(1500);
-    } catch { /* may not be running */ }
+    if (platform === 'win32') {
+      try {
+        deps.execSync('taskkill /F /IM TradingView.exe', { timeout: 5000 });
+        await deps.delay(1500);
+      } catch { /* may not be running */ }
+      return;
+    }
+    await _stopExisting({ tvPath, platform, execSync: deps.execSync, delay: deps.delay });
   };
 
   if (killFirst) await killExisting();
 
-  // Chromium stops painting a page it thinks nobody can see (occluded window,
-  // locked screen), which froze every chart capture in the 2026-10-19
-  // scheduled run behind a locked Mac. These switches keep the renderer and
-  // its timers running while the window is hidden.
-  const cdpArgs = [
-    `--remote-debugging-port=${cdpPort}`,
-    '--disable-backgrounding-occluded-windows',
-    '--disable-renderer-backgrounding',
-    '--disable-background-timer-throttling',
-  ];
+  const cdpArgs = [`--remote-debugging-port=${cdpPort}`, ...ANTI_THROTTLE_SWITCHES];
   let child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
   let info = null;
   let usedLocalCopy = false;
@@ -394,8 +510,16 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   }
 
   if (info) {
+    // The CDP endpoint may belong to an instance this spawn handed off to
+    // rather than the one just started; only its own arguments count.
+    const switches = inspectLaunchSwitches({ cdpPort, _deps: { platform, execSync: deps.execSync } });
+    if (switches.ok === false) {
+      throw new Error(`CDP on port ${cdpPort} is served by TradingView pid ${switches.pid}${switches.pid !== child.pid ? ` (not the spawned pid ${child.pid} — the launch handed off to an existing instance)` : ''}, which lacks ${switches.missing.join(', ')}. Chart captures will freeze while the screen is locked. Quit TradingView and rerun tv_launch${killFirst ? '' : ' without no-kill'}.`);
+    }
     return {
       success: true, platform, binary: tvPath, pid: child.pid,
+      anti_throttle_ok: switches.ok, anti_throttle: switches,
+      ...(switches.ok === null && { warning: _switchWarning(switches) }),
       cdp_port: cdpPort, cdp_url: `http://${CDP_HOST}:${cdpPort}`,
       browser: info.Browser, user_agent: info['User-Agent'],
       ...(usedLocalCopy && { msix_local_copy: true }),

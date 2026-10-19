@@ -3,7 +3,7 @@ import * as core from '../../core/health.js';
 import { update } from '../../core/update.js';
 
 register('status', {
-  description: 'Check CDP connection to TradingView',
+  description: 'Check CDP connection to TradingView (and its anti-throttling launch switches)',
   handler: () => core.healthCheck(),
 });
 
